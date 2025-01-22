@@ -1,0 +1,161 @@
+@startuml
+title "Braze Engagement Event Processor"
+
+state "Braze Engagement Event Processor" as process1 #e8d3d6{
+
+    state "S3"  as s3 #lightblue {
+        state "braze-message-engagement-stage" as landing_folder
+        landing_folder:Respective folder for each type of events\nEx: send, click, unsubscribe
+    }
+
+    [*]-r->landing_folder:braze engagement        \n event avro file
+    landing_folder-->lambda: Event Trigger\ns3 Event
+
+    state "AWS Lambda" as lambda #lightpink{
+        [*]-r->initialization: event
+        initialization:s3_client
+        initialization:event_bridge_client
+        state "Environment and Local Variables" as variable_init
+
+        initialization-r->variable_init
+        variable_init:configuration_bucket
+        variable_init:configuration_json
+        variable_init:event_bus_arn
+        variable_init:triggered_bucket
+        variable_init:triggered_file_key
+        variable_init:s3_triggered_object
+        variable_init:configuration_object
+        variable_init:configuration_data
+
+        state "CSATBrazeEventProcessor" as event_processor{
+            variable_init-r->event_processor
+            [*]-->instance
+            instance:transformers
+            instance:supportedTypes
+            note left of instance: Creating transformer instances and \n supported types\n\nOnly unique transformers are added to the list
+
+            state TransformerBase
+
+            state GenericTransformer:transform()
+
+            state UnsubscribeTransformer:transform()
+            UnsubscribeTransformer:variable_email_address()
+
+            state SubscriptionGroupTransformer:transform()
+            SubscriptionGroupTransformer:variable_email_address()
+            SubscriptionGroupTransformer:variable_subscription_group_id()
+            SubscriptionGroupTransformer:variable_subscription_status()
+
+            TransformerBase:transform()
+
+            GenericTransformer<-d-TransformerBase
+            UnsubscribeTransformer<-d-TransformerBase
+            SubscriptionGroupTransformer<-d-TransformerBase
+
+            instance-->getEventTypeFromS3Key
+            getEventTypeFromS3Key: Get the event type
+
+            getEventTypeFromS3Key-->processAvroEvents
+
+            processAvroEvents:Create Business events\nby using the respective\nclass functions and \nproduces the \nlist of business events
+        }
+
+        state more_events <<choice>>
+
+        event_processor-->more_events
+
+        state "EventBridgePublish" as eb_inst{
+            more_events-->eb_inst
+            state end <<end>>
+            state for_loop <<choice>>
+            events-->for_loop
+            for_loop-d->publish: Event Exists
+            for_loop-r->end
+        }
+        more_events-r->[*]:\t End\t\t
+
+        note left of eb_inst: All the business events\niterated and sent to \nEventBridge bus which\nwill match the pattern and\nsend matched events \ntriggers the unsubscribe lambda
+    }
+    note right of lambda:Business Event Template:\n\n\n{\n\t"id":"",\n\t"time":"",\n\t"detail-type":"ConsentChangeFact",\n\t"source":"braze.components.CDP.CDF",\n\t"detail":{\n\t\t"data":{\n\t\t\t"consent-type":"",\n\t\t\t"status":"",\n\t\t\t"emails":[],\n\t\t\t"source":""\n\t\t\t},\n\t\t"metadata":{\n\t\t"metadata-type":"processor.engagement.braze.lambda.components.CDP.CDF",\n\t\t"detail":{\n\t\t\t"event-type":"","s3-key":""\n\t\t\t}\n\t\t}\n\t}\n}
+    note left of lambda:Configuration JSON for identifying transformer class:\n\n{\n  \"version\":\"1\",\n  \"event-mappings\":[\n    {\n      \"braze-type\":\"users.messages.email.Unsubscribe\",\n      \"business-event-type\":\"ConsentChangeFact\",\n      \"business-event-consolidated\":\"true\",\n      \"transformer\":\"UnsubscribeTransformer\",\n      \"input-path\":{\n        \"detail.data.consent-type\":\"first\",\n        \"detail.data.status\":\"opt-out\",\n        \"detail.data.emails\":[\n          \"email_address\"\n        ],\n        \"detail.data.source\":\"email.unsubscribe\",\n        \"detail.metadata.detail.event-type\":[\n          \"global_BrazeType\"\n        ],\n        \"detail.metadata.detail.s3-key\":[\n          \"global_S3Reference\"\n        ]\n      }\n    },\n    {\n      \"braze-type\":\"users.behaviors.subscriptiongroup.StateChange\",\n      \"business-event-type\":\"ConsentChangeFact\",\n      \"business-event-consolidated\":\"true\",\n      \"transformer\":\"SubscriptionGroupTransformer\",\n      \"input-path\":{\n        \"detail.data.consent-type\":[\n          \"subscription_group_id\"\n        ],\n        \"detail.data.status\":[\n          \"subscription_status\"\n        ],\n        \"detail.data.source\":\"$state_change_source\",\n        \"detail.data.emails\":[\n          \"email_address\"\n        ],\n        \"detail.metadata.detail.event-type\":[\n          \"global_BrazeType\"\n        ],\n        \"detail.metadata.detail.s3-key\":[\n          \"global_S3Reference\"\n        ]\n      }\n    }\n  ]\n}
+}
+process1-r->process2
+
+state "Unsubscribe Process V2" as process2{
+
+
+    state "AWS Lambda" as lambda2 #lightpink{
+        [*]-r->init: event
+
+        init:s3_client
+        init:secret_client
+        init:sns_client
+
+        state "Environment, Local Variables and Secret Values" as env_variable
+
+        init-r->env_variable
+
+        env_variable:emarsys_secret
+        env_variable:big_query_secret
+        env_variable:campaign_id\napi_emarsys_username\napi_emarsys_secret\nbig_query_credentials
+        env_variable:chunk_size
+        env_variable:error_topic
+
+        env_variable-->big_query_client:\n big_query_credentials
+
+        big_query_client-->pre_step
+
+        state "Process Pre-Step" as pre_step{
+            note "Fetch following details from input event\n\n* email list as email_addresses_to_process\n* Consent Type\n\nif the email list is \nmore than the chunk_size\nsplit the list into \nmultiple chunks " as n
+
+        }
+        state chunk_available <<choice>>
+        state emarsys_result <<choice>>
+        state gbq_result <<choice>>
+
+        note left of chunk_available:if more chunks
+        pre_step-->chunk_available: iterate the list of chunks
+
+        chunk_available-->chunk
+        chunk-r->emarsys_class: list of email address
+
+        state "EmarsysHelper" as emarsys_class{
+            emarsys_class:initialized with \nlogger, \napi_emarsys_username\n,api_emarsys_secret, consent_type
+            state "unsubscribeContacts(chunck)" as unsubscribeContacts
+
+            note right of unsubscribeContacts:* Validate each email address against pattern\n* Create instance of UnsubscribeResult for each email\n* Create payload for create or update contact\n* Call EmarsysAPI with payload\n* Resolve the duplicates for the duplicate email addresses\n* Create the statistics
+
+        }
+        emarsys_class-r->emarsys_result : Check if the result is completed
+
+
+        state "GoogleBigQueryHelper" as gbq_class{
+            gbq_class:initialized with \nlogger, \nbig_query_client, \nconsent_type
+
+            state "addPermissionChanges(\nunsubscribedIds, \ncampaign_id\n)" as addPermissionChanges
+
+            note bottom of addPermissionChanges: * For each contact id create \n   create query template\n* Prepare the query\n* Using big query client call\n   query function by passing\n   prepared query template\n* Get the query result\n* Verify the count\n* Prepare and Return Statistics
+        }
+        emarsys_result-->gbq_class: Yes
+        gbq_class-u->log_result: Log result
+        log_result:Appends all the results
+        gbq_class-->gbq_result: Check if the result is completed
+
+        gbq_result-l->log_the_gbq_stats: Yes
+        gbq_result-l->log_the_gbq_stats: No
+
+        log_the_gbq_stats:All the results are added to the \n same list
+        log_the_gbq_stats-->break_gbq:If result is not completed
+        emarsys_result-r->log_result: No\t\t
+
+        log_result-->break: Break the loop if not completed
+
+        log_the_gbq_stats-u->chunk_available:If Successfiul
+
+
+
+
+
+
+}
+@enduml
